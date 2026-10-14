@@ -1,0 +1,124 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum FriendStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum QuestionSign {
+  ADD
+  SUBTRACT
+  MULTIPLY
+  DIVIDE
+}
+
+enum GameMemberStatus {
+  IN_GAME
+  WON
+  LOST
+  DRAW
+}
+
+enum GameStatus {
+  RUNNING
+  SEARCHING_FOR_PLAYER
+  ENDED
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  username  String   @unique
+  password  String //hash
+  createdAt DateTime @default(now())
+
+  rating     UserRating?
+  gameMember GameMember[]
+  answers    QuestionAnswer[]
+
+  sender   Friends[] @relation("Sender")
+  receiver Friends[] @relation("Receiver")
+}
+
+model Game {
+  id        String     @id @default(uuid())
+  timelimit Int //minutes
+  startedAt DateTime   @default(now())
+  endedAt   DateTime?
+  status    GameStatus @default(SEARCHING_FOR_PLAYER)
+
+  gameMember GameMember[]
+  answers    QuestionAnswer[]
+  questions  Question[]
+}
+
+model Question {
+  id     String @id @default(uuid())
+  gameId String
+  game   Game   @relation(references: [id], fields: [gameId], onDelete: Cascade)
+
+  systemAnswer Int
+  operation1   Int
+  operation2   Int
+  sign         QuestionSign
+
+  answers QuestionAnswer[]
+}
+
+model QuestionAnswer {
+  id         String   @id @default(uuid())
+  questionId String
+  question   Question @relation(references: [id], fields: [questionId], onDelete: Cascade)
+
+  answer Int
+  gameId String
+  game   Game   @relation(references: [id], fields: [gameId], onDelete: Cascade)
+
+  userId    String
+  user      User     @relation(references: [id], fields: [userId], onDelete: Cascade)
+  createdAt DateTime @default(now())
+}
+
+model GameMember {
+  id     String           @id @default(uuid())
+  gameId String
+  game   Game             @relation(references: [id], fields: [gameId], onDelete: Cascade)
+  userId String
+  user   User             @relation(references: [id], fields: [userId], onDelete: Cascade)
+  status GameMemberStatus @default(IN_GAME)
+
+  @@unique([gameId, userId])
+}
+
+model UserRating {
+  id     String @id @default(uuid())
+  userId String @unique
+  rating Int    @default(0)
+  user   User   @relation(references: [id], fields: [userId], onDelete: Cascade)
+}
+
+model Friends {
+  id         String @id @default(uuid())
+  receiverId String
+  receiver   User   @relation("Receiver", references: [id], fields: [receiverId], onDelete: Cascade)
+
+  senderId  String
+  sender    User         @relation("Sender", references: [id], fields: [senderId], onDelete: Cascade)
+  status    FriendStatus @default(PENDING)
+  createdAt DateTime     @default(now())
+
+  @@unique([senderId, receiverId])
+}
