@@ -1,102 +1,210 @@
 import { WebSocketServer, WebSocket } from "ws";
-import { verify, type JwtPayload } from "jsonwebtoken";
 import { prisma } from "@repo/db/client";
+import { verify, type JwtPayload } from "jsonwebtoken";
+import type { Game, Question, User } from "./types";
+import { generateQuestions } from "./utils";
 
-const JWT_SECRET = process.env.JWT_SECRET || "supersecret";
 const wss = new WebSocketServer({ port: 8080 });
+const JWT_SECRET = process.env.JWT_SECRET!;
 
-export interface OnlineUser {
-    id: string;
-    name: string;
-    ws: WebSocket;
-}
+const onlineUsers: Map<string, User> = new Map();
+const games: Map<string, Game> = new Map();
+const currentQuestions: Map<string, number> = new Map();
+const allQuestions: Map<string, Question[]> = new Map();
 
-const onlineUsers = new Map<string, OnlineUser>();
+type ExtendedWs = WebSocket & { userId: string };
 
-interface WebSocketMessage {
-    type: 'JOIN' | 'SEND_MESSAGE';
-    payload: {
-        name: string;
-        message?: string;
-        roomId: string;
-    };
-}
+wss.on("connection", async (ws: ExtendedWs, req) => {
+  // https://url.com?token=
+  const token = req.url?.split("?token=")[1];
 
-wss.on("connection", async (ws, req) => {
-    const url = new URL(req.url ?? '', `http://${req.headers.host || 'localhost'}`);
-    const token = url.searchParams.get("token");
+  console.log("token", token);
 
-    if (!token) {
-        ws.close(1008, "Token required");
-        return;
-    }
+  if (!token) {
+    ws.close();
+    return;
+  }
 
-    let decoded: JwtPayload & { userId: string };
-    try {
-        decoded = verify(token, JWT_SECRET) as JwtPayload & { userId: string };
-    } catch (err) {
-        ws.close(1008, "Invalid or expired token");
-        return;
-    }
+  console.log("token", token);
 
-    if (!decoded?.userId) {
-        ws.close(1008, "Invalid token payload");
-        return;
-    }
+  let decoded;
 
-    const user = await prisma.user.findUnique({
-        where: {
-            id: decoded.userId
+  try {
+    decoded = verify(token, JWT_SECRET) as JwtPayload;
+  } catch (e) {
+    ws.close();
+    return;
+  }
+
+  // priyankar, xyz
+  const user = await prisma.user.findUnique({
+    where: { id: decoded.userId },
+  });
+
+  if (!user) {
+    ws.close();
+    return;
+  }
+
+  ws.userId = decoded.userId;
+
+  onlineUsers.set(decoded.userId, {
+    name: user.username,
+    ws,
+    id: user.id,
+  });
+
+  wss.clients.forEach((wsAll) => {
+    wsAll.send(
+      JSON.stringify({
+        type: "ONLINE_USERS",
+        payload: {
+          user: Array.from(onlineUsers),
+        },
+      }),
+    );
+  });
+
+  ws.on("message", (event) => {
+    const parsedData = JSON.parse(event.toString());
+
+    if (parsedData.type == "PLAY_GAME") {
+      const {} = parsedData.payload;
+
+      let runningGame: Game | null = null;
+
+      for (const [gameId, game] of games.entries()) {
+        if (game.status == "SEARCHING_FOR_PLAYER") {
+          runningGame = game;
+          break;
         }
-    });
+      }
 
-    if (!user) {
-        ws.close(1008, "User not found");
+      if (!runningGame) {
+        const gameId = crypto.randomUUID();
+
+        games.set(gameId, {
+          id: gameId,
+          members: [
+            {
+              id: user.id,
+              name: user.username,
+              ws,
+            },
+          ],
+          adminId: user.id,
+          status: "SEARCHING_FOR_PLAYER",
+          questions: [],
+          answers: [],
+        });
+
+        wss.clients.forEach((wsAll) => {
+          if (wsAll == ws) return;
+
+          wsAll.send(
+            JSON.stringify({
+              type: "GAME_REQUEST",
+              payload: { gameId },
+            }),
+          );
+        });
+
         return;
-    }
+      }
 
-    const userId = user.id;
+      const currentGameFetched = games.get(runningGame.id)!;
 
-    onlineUsers.set(userId, {
+      currentGameFetched.members.push({
         id: user.id,
         name: user.username,
-        ws: ws
-    });
+        ws,
+      });
 
-    console.log(`User connected: ${user.username} (${userId})`);
+      const questions = generateQuestions();
 
-    wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: "USER_JOINED",
-                payload: {
-                    users: "ONLINE_USERS",
-                    user: {
-                        id: userId,
-                        name: user.username
-                    }
-                },
-            }));
-        }
-    });
+      currentGameFetched.questions = questions;
 
-    ws.on("message", (event) => {
-        try {
-            const parsedData: WebSocketMessage = JSON.parse(event.toString());
+      allQuestions.set(runningGame.id, questions);
 
-            if (parsedData.type === 'JOIN' && parsedData.payload?.roomId) {
-                console.log(`User ${userId} joined room ${parsedData.payload.roomId}`);
-            }
-        } catch (err) {
-            console.error("Invalid JSON message:", err);
-        }
-    });
+      currentGameFetched.status = "RUNNING";
 
-    ws.on("close", () => {
-        onlineUsers.delete(userId);
-        console.log(`User ${userId} disconnected`);
-    });
+      games.set(currentGameFetched.id, currentGameFetched);
+
+      const firstQuestion = currentGameFetched.questions[0]!;
+
+      const key = `g:${currentGameFetched.id}-u:${user.id}-q:${firstQuestion.id}`;
+
+      console.log("key", key);
+
+      currentQuestions.set(key, 0);
+
+      currentGameFetched.members.forEach((mem) =>
+        mem.ws.send(
+          JSON.stringify({
+            type: "QUESTION",
+            payload: {
+              gameId: runningGame.id,
+              question: firstQuestion,
+            },
+          }),
+        ),
+      );
+    }
+
+    if (parsedData.type == "SUBMIT_ANSWER") {
+      const { gameId, questionId, answer } = parsedData.payload;
+
+      const existingGame = games.get(gameId);
+
+      if (!existingGame) {
+        ws.close();
+        return;
+      }
+
+      const existingQuestion = existingGame.questions.find(
+        (qs) => qs.id == questionId,
+      );
+
+      if (!existingQuestion) {
+        ws.close();
+        return;
+      }
+
+      const filteredAnswers = existingGame.answers.filter((exGm) => {
+        exGm.questionId !== questionId;
+      });
+
+      filteredAnswers.push({
+        id: crypto.randomUUID(),
+        answer,
+        questionId,
+      });
+
+      if (answer !== existingQuestion.answer) {
+        return;
+      }
+
+      const key = `g:${existingGame.id}-u:${user.id}-q:${existingQuestion.id}`;
+      console.log("key", key);
+      const currentQuestionIndex = currentQuestions.get(key) ?? 0;
+      const storedQuestions = allQuestions.get(existingGame.id)!;
+
+      console.log("storedQuestions", storedQuestions);
+
+      const nextQuestion = storedQuestions[currentQuestionIndex + 1];
+      console.log("next question", nextQuestion);
+      console.log("index", currentQuestionIndex);
+      currentQuestions.set(key, currentQuestionIndex + 1);
+
+      ws.send(
+        JSON.stringify({
+          type: "QUESTION",
+          payload: {
+            gameId: existingGame.id,
+            question: nextQuestion,
+          },
+        }),
+      );
+    }
+  });
 });
-
-console.log("Server started on port 8080");
-
